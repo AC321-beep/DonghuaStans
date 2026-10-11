@@ -1,0 +1,399 @@
+package com.donghuastream
+
+import android.util.Base64
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import org.jsoup.select.Elements
+import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicBoolean
+
+open class DonghuastreamProvider : MainAPI() {
+    override var mainUrl = "https://donghuastream.org"
+    override var name = "DonghuaStream"
+    override val hasMainPage = true
+    override var lang = "zh"
+    override val hasDownloadSupport = true
+    override val supportedTypes = setOf(TvType.Anime)
+
+    private val defaultHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Referer" to mainUrl,
+        "Origin" to mainUrl
+    )
+
+    // PRE-COMPILED REGEXES
+    private val junkRegex = Regex("(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\\(4K\\)|\\[4K\\]|\\(1080p\\)|\\[1080p\\]|4K|1080p|720p|Full Movie|Eps Full|Movie)")
+    private val epJunkRegex = Regex("(?i)(Episode|Ep\\.?|Part|SP|Special)\\s*\\d+.*")
+    private val nonAlphaNumericRegex = Regex("[^a-zA-Z0-9]")
+    private val fullMovieRegex = Regex("""(?i)\bfull\b""")
+    private val epNumRegex = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.|Part|SP|Special)\s*(\d+(?:\s*[-~]\s*\d+)?)""")
+    private val rangeRegex = Regex("""\b(\d+[-~]\d+)\b""")
+    private val digitsRegex = Regex("""\d+""")
+    private val videoIdRegex = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
+    private val qualityRegex = Regex("""(?i)(4K|1080p|720p|2160p|HD|SD)""")
+    private val titleCleanRegex = Regex("(?i)\\s*(Episode|Movie).*")
+
+    // Robust Date Regexes
+    private val dateRegex = Regex("""([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})""")
+    private val relativeDateRegex = Regex("""(?i)\d+\s+(mins?|hours?|days?|weeks?|months?|years?)\s+ago""")
+
+    override val mainPage = mainPageOf(
+        "anime/?status=&type=&order=update&page=" to "Recently Updated",
+        "special_edition" to "Special Edition"
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (request.name == "Special Edition") {
+            val combinedResults = coroutineScope {
+                val movieDeferred = async {
+                    try {
+                        app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=movie", headers = defaultHeaders, cacheTime = 0).document
+                    } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                }
+                val specialDeferred = async {
+                    try {
+                        app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=special", headers = defaultHeaders, cacheTime = 0).document
+                    } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                }
+
+                val movieResults = movieDeferred.await()?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                val specialResults = specialDeferred.await()?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+
+                (movieResults + specialResults).distinctBy { it.name.trim().lowercase() }
+            }
+
+            return newHomePageResponse(
+                list = HomePageList(request.name, combinedResults, isHorizontalImages = false),
+                hasNext = combinedResults.isNotEmpty()
+            )
+        }
+
+        val home = if (page == 1) {
+            coroutineScope {
+                val headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache")
+                val homeDocDeferred = async {
+                    try { app.get("$mainUrl/", headers = headers, cacheTime = 0).document }
+                    catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                }
+                val dirDocDeferred = async {
+                    try { app.get("$mainUrl/${request.data}1", headers = headers, cacheTime = 0).document }
+                    catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                }
+
+                val homeDoc = homeDocDeferred.await()
+                val dirDoc = dirDocDeferred.await()
+
+                val containers = homeDoc?.select(".bixbox, .releases")
+                val latestContainer = containers?.find {
+                    val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
+                    headerTitle.contains("Latest", ignoreCase = true) || headerTitle.contains("Recent", ignoreCase = true)
+                } ?: homeDoc?.selectFirst(".releases.latesthome") ?: containers?.lastOrNull()
+
+                val homeArticles = latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                val dirArticles = dirDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+
+                (homeArticles + dirArticles).distinctBy {
+                    it.name.replace(junkRegex, "")
+                        .replace(epJunkRegex, "")
+                        .replace(nonAlphaNumericRegex, "")
+                        .lowercase()
+                }
+            }
+        } else {
+            app.get("$mainUrl/${request.data}$page", headers = defaultHeaders, cacheTime = 0)
+                .document.select("div.listupd > article")
+                .mapNotNull { it.toSearchResult() }
+        }
+
+        return newHomePageResponse(
+            list = HomePageList(request.name, home, isHorizontalImages = false),
+            hasNext = home.isNotEmpty()
+        )
+    }
+
+    private fun Element.toSearchResult(): SearchResponse? {
+        val aTag = this.selectFirst("div.bsx > a, a[href]") ?: return null
+
+        val title = aTag.attr("title").takeIf { it.isNotBlank() }
+            ?: this.selectFirst(".tt, .tt h2, h2, h3, h4")?.text()?.takeIf { it.isNotBlank() }
+            ?: aTag.text().takeIf { it.isNotBlank() } ?: return null
+
+        val href = fixUrlNull(aTag.attr("href")) ?: return null
+        val posterUrl = fixUrlNull(this.getImageAttr())
+
+        return newMovieSearchResponse(title.trim(), href, TvType.Anime) {
+            this.posterUrl = posterUrl
+        }
+    }
+
+    private fun Element.getImageAttr(): String? {
+        return attr("data-src").takeIf { it.isNotBlank() }
+            ?: selectFirst("img")?.attr("data-src")?.takeIf { it.isNotBlank() }
+            ?: attr("src").takeIf { it.isNotBlank() }
+            ?: selectFirst("img")?.attr("src")
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> = coroutineScope {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        (1..3).map { page ->
+            async {
+                try {
+                    val url = "$mainUrl/pagg/$page/?s=$encoded"
+                    app.get(url, headers = defaultHeaders).document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    emptyList()
+                }
+            }
+        }.awaitAll().flatten().distinctBy { it.url }
+    }
+
+    private fun getEpisodesElements(document: Document): Elements {
+        return document.select("table tbody tr:not(:has(th)), div.episodelist ul li, div.eplister ul li, ul.eplister li, .ep_list li, .episodelist li, .eplister li, #episodelist li, .lsteps li, .list1 li").takeIf { it.isNotEmpty() }
+            ?: document.select("div.episodelist a[href], div.eplister a[href], .ep_list a[href], .episodelist a[href], .eplister a[href], #episodelist a[href], .lsteps a[href], .list1 a[href]")
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val document = app.get(url, headers = defaultHeaders).document
+        val isEpisodePage = document.selectFirst(".infox, .tsinfo, .anime-info") == null
+
+        if (isEpisodePage) {
+            var seriesUrl = document.select("div.ts-breadcrumb a").toList().findLast {
+                val h = it.attr("href")
+                h.isNotBlank() && h != mainUrl && h != "$mainUrl/" && !h.endsWith("/anime/") && !h.endsWith("/movie/") && !h.endsWith("/series/")
+            }?.attr("href") ?: document.selectFirst(".naveps a:contains(All)")?.attr("href")
+
+            if (!seriesUrl.isNullOrBlank() && fixUrl(seriesUrl) != url) {
+                return load(fixUrl(seriesUrl))
+            }
+
+            val titleRaw = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
+            val title = titleRaw.replace(titleCleanRegex, "").trim()
+            val poster = document.selectFirst("meta[property=og:image]")?.attr("content") ?: ""
+            val epElements = getEpisodesElements(document)
+
+            if (epElements.isNotEmpty()) {
+                val episodes = parseEpisodes(epElements)
+                return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+                    this.posterUrl = poster
+                }
+            }
+
+            return newMovieLoadResponse(titleRaw, url, TvType.Movie, url) {
+                this.posterUrl = poster
+            }
+        }
+
+        val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
+        val poster = document.selectFirst("div.ime > img")?.attr("data-src")?.takeIf { it.isNotBlank() }
+            ?: document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
+        val description = document.selectFirst("div.entry-content")?.text()?.trim()
+        val type = document.selectFirst(".spe")?.text() ?: ""
+        val tvtag = if (type.contains("Movie", ignoreCase = true)) TvType.Movie else TvType.TvSeries
+
+        val epElements = getEpisodesElements(document)
+
+        return if (tvtag == TvType.TvSeries || epElements.size > 1) {
+            val episodes = parseEpisodes(epElements)
+            newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+                this.posterUrl = poster
+                this.plot = description
+            }
+        } else {
+            val href = epElements.firstOrNull()?.selectFirst("a[href]")?.attr("href") ?: url
+            newMovieLoadResponse(title, url, TvType.Movie, fixUrl(href)) {
+                this.posterUrl = poster
+                this.plot = description
+            }
+        }
+    }
+
+    private fun parseEpisodes(epElements: Elements): List<Episode> {
+        return epElements.mapNotNull { info ->
+            val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
+            val href1 = aTag?.attr("href") ?: return@mapNotNull null
+            val href = fixUrl(href1)
+
+            val rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                ?: aTag.text().trim().takeIf { it.isNotBlank() }
+                ?: info.text().trim()
+
+            val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) ||
+                              rawTitle.contains("Eps Full", ignoreCase = true) ||
+                              fullMovieRegex.containsMatchIn(rawTitle)
+
+            val trueEpMatch = epNumRegex.findAll(rawTitle).firstOrNull()
+            val matchStr = trueEpMatch?.groupValues?.get(1)?.trim()
+
+            var episodeNum: Int? = null
+            val epName: String
+
+            if (isFullMovie && matchStr == null) {
+                episodeNum = 0
+                epName = "Full Movie"
+            } else if (matchStr != null) {
+                episodeNum = digitsRegex.find(matchStr)?.value?.toIntOrNull()
+                epName = "Episode $matchStr"
+            } else {
+                val rangeMatch = rangeRegex.find(rawTitle)
+                if (rangeMatch != null) {
+                    val rawRange = rangeMatch.groupValues[1]
+                    episodeNum = digitsRegex.find(rawRange)?.value?.toIntOrNull()
+                    epName = "Episode $rawRange"
+                } else {
+                    val cleanedTitle = rawTitle.replace(qualityRegex, "")
+                    val numbers = digitsRegex.findAll(cleanedTitle).map { it.value }.toList()
+
+                    episodeNum = numbers.lastOrNull { num ->
+                        !(num.length == 4 && num.startsWith("20"))
+                    }?.toIntOrNull()
+
+                    epName = if (episodeNum != null) "Episode $episodeNum" else "Episode"
+                }
+            }
+
+            val posterr = info.selectFirst("img")?.getImageAttr()?.let { fixUrlNull(it) } ?: ""
+
+            // --- LAYERED DATE EXTRACTION ---
+            val cssDate = info.selectFirst(".epl-date, .date, .time, .rightoff, .epdate, .published, .released")?.text()?.trim()
+            val fullText = info.text()
+
+            val extractedDate = cssDate.takeIf { !it.isNullOrBlank() }
+                ?: dateRegex.find(fullText)?.value?.trim()
+                ?: relativeDateRegex.find(fullText)?.value?.trim()
+
+            newEpisode(href) {
+                this.name = epName
+                this.episode = episodeNum
+                this.posterUrl = posterr
+
+                if (!extractedDate.isNullOrBlank()) {
+                    this.addDate(extractedDate, format = "MMMM d, yyyy")
+                    this.description = extractedDate
+                }
+            }
+        }.reversed()
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // Timeout on the episode page fetch — a hung page no longer blocks the UI
+        val doc = withTimeoutOrNull(15_000L) {
+            try { app.get(data, headers = defaultHeaders).document } catch (e: Exception) { null }
+        } ?: return false
+
+        val options = doc.select("option[data-index]")
+
+        val found = AtomicBoolean(false)
+        val callbackLock = Any()
+        val subtitleLock = Any()
+        val semaphore = Semaphore(4)  // cap parallel extractor calls
+
+        fun emitLink(link: ExtractorLink) {
+            found.set(true)
+            synchronized(callbackLock) { callback(link) }
+        }
+
+        fun emitSubtitle(sub: SubtitleFile) {
+            synchronized(subtitleLock) { subtitleCallback(sub) }
+        }
+
+        suspend fun invokeExtractor(iframeUrl: String, label: String) {
+            var finalUrl = iframeUrl
+            var extReferer = iframeUrl
+
+            if (!finalUrl.contains("ok.ru", ignoreCase = true) &&
+                finalUrl.contains("dailymotion", ignoreCase = true)
+            ) {
+                val videoIdMatch = videoIdRegex.find(finalUrl)
+                if (videoIdMatch != null) {
+                    finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
+                    extReferer = mainUrl
+                }
+            }
+
+            val wrappedCallback: (ExtractorLink) -> Unit = { emitLink(it) }
+            val wrappedSubtitle: (SubtitleFile) -> Unit = { emitSubtitle(it) }
+
+            when {
+                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl ->
+                    OkRuCustom().getUrl(finalUrl, extReferer, wrappedSubtitle, wrappedCallback)
+
+                "rumble.com" in finalUrl ->
+                    Rumble().getUrl(finalUrl, finalUrl, wrappedSubtitle, wrappedCallback)
+
+                "play.streamplay.co.in" in finalUrl ->
+                    PlayStreamplay().getUrl(finalUrl, finalUrl, wrappedSubtitle, wrappedCallback)
+
+                finalUrl.endsWith(".mp4") ->
+                    wrappedCallback(
+                        newExtractorLink(label, label, finalUrl, INFER_TYPE) {
+                            this.referer = mainUrl
+                            this.quality = getQualityFromName(label)
+                        }
+                    )
+
+                else ->
+                    loadExtractor(finalUrl, referer = extReferer, wrappedSubtitle, wrappedCallback)
+            }
+        }
+
+        // Decode all mirror options first (CPU-only, fast)
+        val decoded = options.mapNotNull { option ->
+            val base64 = option.attr("value")
+            if (base64.isBlank()) return@mapNotNull null
+            val label = option.text().trim()
+            val src = try {
+                Jsoup.parse(base64Decode(base64)).selectFirst("iframe")?.attr("src")
+            } catch (_: Exception) {
+                null
+            }
+            src?.let { httpsify(it) to label }
+        }
+
+        // Fallback: no mirrors → use the default player iframe
+        val finalSources = if (decoded.isEmpty()) {
+            doc.selectFirst(".player-area iframe, .playcon iframe")
+                ?.attr("src")
+                ?.let(::httpsify)
+                ?.let { listOf(it to "Server") }
+                ?: emptyList()
+        } else decoded
+
+        // Fire all extractors in parallel — links stream to the UI as they resolve
+        coroutineScope {
+            finalSources.map { (url, label) ->
+                async {
+                    semaphore.withPermit {
+                        try {
+                            withTimeoutOrNull(20_000L) {
+                                invokeExtractor(url, label)
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            // swallow — one bad extractor doesn't kill the rest
+                        }
+                    }
+                }
+            }.awaitAll()
+        }
+
+        return found.get()
+    }
+}
